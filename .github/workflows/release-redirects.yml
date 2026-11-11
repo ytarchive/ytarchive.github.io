@@ -1,0 +1,202 @@
+name: Archive release redirects
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-release-redirects
+  queue: max
+
+jobs:
+  redirects:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the archive branch
+        uses: actions/checkout@main
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.GH_PAT || github.token }}
+          sparse-checkout: catalog
+
+      - name: Commit the release download pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 - <<'PY'
+          import html
+          import json
+          from mimetypes import guess_type
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          from textwrap import dedent
+          from urllib.parse import urlsplit
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['ARCHIVE_BRANCH']
+          video_root = Path('video')
+          marker = '<!-- Genenrated from release -->'
+          manual = os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+
+          def run(*args, **options):
+              return subprocess.run(args, check=True, **options)
+
+          def api_list(endpoint):
+              output = run('gh', 'api', '--paginate', '--slurp',
+                           f'repos/{repository}/{endpoint}?per_page=100',
+                           capture_output=True, text=True).stdout
+              return [item for page in json.loads(output) for item in page]
+
+          def release_pages(filename, url):
+              target = urlsplit(url)
+              prefix = f'/{repository}/releases/download/'
+              if target.scheme != 'https' or target.netloc != 'github.com' or not target.path.lower().startswith(prefix.lower()):
+                  raise ValueError('Expected a download URL for an asset in this repository.')
+              attribute = html.escape(url, quote=True)
+              script_value = json.dumps(url).replace('<', '\\u003c')
+              redirect = (
+                  '<!DOCTYPE html>\n<html>\n<head>\n'
+                  f'<meta http-equiv="refresh" content="0;url={attribute}">\n'
+                  f'<script>window.location.replace({script_value});</script>\n'
+                  '</head>\n<body></body>\n</html>\n'
+              )
+              mime_type, _ = guess_type(filename)
+              if not mime_type or not mime_type.startswith('video/'):
+                  return f'{marker}\n{redirect}', redirect
+
+              title = html.escape(filename)
+              page = dedent(f'''\
+                  {marker}
+                  <!DOCTYPE html>
+                  <html lang="en">
+                  <head>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <title>{title}</title>
+                    <style>
+                      body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111; color: #eee; font: 1rem system-ui; text-align: center; }}
+                      video {{ display: block; width: min(100vw, 1200px); max-height: 90vh; }}
+                      a {{ color: #b7d5ff; }}
+                    </style>
+                  </head>
+                  <body>
+                    <main id="viewer" hidden>
+                      <video controls playsinline preload="metadata"></video>
+                      <p id="playback-error" hidden>Playback is unavailable. <a href="{attribute}">Download video</a></p>
+                    </main>
+                    <noscript><a href="{attribute}">Download video</a></noscript>
+                    <script>
+                      const source = {script_value};
+                      if (new URLSearchParams(location.search).get("view") === "true") {{
+                        const viewer = document.getElementById("viewer");
+                        const player = viewer.querySelector("video");
+                        player.addEventListener("error", () => {{
+                          document.getElementById("playback-error").hidden = false;
+                        }});
+                        player.src = source;
+                        viewer.hidden = false;
+                      }} else {{
+                        window.location.replace(source);
+                      }}
+                    </script>
+                  </body>
+                  </html>
+                  ''')
+              return page, redirect
+
+          def write_page(path, page, legacy_redirect):
+              if path.is_symlink() or (path.exists() and not path.is_file()):
+                  raise ValueError(f'The redirect path {path} is not a regular file.')
+              if path.exists():
+                  current = path.read_text(encoding='utf-8')
+                  if current == page:
+                      return
+                  if not current.startswith(marker) and current.rstrip() != legacy_redirect.rstrip():
+                      raise ValueError(f'A different file already exists at {path}.')
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(page, encoding='utf-8')
+              run('git', 'add', '-f', '--', str(path))
+
+          def move_legacy_folder(video_id):
+              source = Path(video_id)
+              destination = video_root / video_id
+              if destination.is_symlink():
+                  raise ValueError(f'The archive directory {destination} is a symbolic link.')
+              if not destination.exists():
+                  run('git', 'mv', '--', str(source), str(destination))
+                  return
+              for file in source.iterdir():
+                  target = destination / file.name
+                  if target.exists() or target.is_symlink():
+                      raise ValueError(f'Cannot move {file} because {target} already exists.')
+                  run('git', 'mv', '--', str(file), str(target))
+
+          if manual:
+              releases = api_list('releases')
+          else:
+              event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+              releases = [event['release']]
+
+          redirects = {}
+          for release in releases:
+              video_id = release['tag_name']
+              if release['draft'] or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+                  continue
+              for asset in api_list(f"releases/{release['id']}/assets"):
+                  if asset['state'] != 'uploaded':
+                      continue
+                  filename = asset['name']
+                  if filename in {'', '.', '..'} or re.search(r'[/\\\x00-\x1f\x7f]', filename):
+                      raise ValueError('Invalid release asset filename.')
+                  redirects.setdefault(video_id, {})[filename] = release_pages(filename, asset['browser_download_url'])
+
+          run('git', 'config', 'user.name', 'github-actions[bot]')
+          run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          for attempt in range(3):
+              run('git', 'fetch', '--depth=1', '--no-tags', 'origin', branch)
+              run('git', 'reset', '--hard', 'FETCH_HEAD')
+              legacy = set()
+              if manual:
+                  paths = os.fsdecode(run('git', 'ls-tree', '-rz', '--name-only', 'HEAD', capture_output=True).stdout)
+                  for path in paths.split('\0'):
+                      match = re.fullmatch(r'([A-Za-z0-9_-]{11})/(?:video-)?\1\.mp4', path)
+                      if match:
+                          legacy.add(match[1])
+              folders = {'catalog', *legacy, *(str(video_root / video_id) for video_id in legacy | redirects.keys())}
+              run('git', 'sparse-checkout', 'set', '--cone', '--stdin', input='\n'.join(sorted(folders)) + '\n', text=True)
+
+              if video_root.is_symlink():
+                  raise ValueError('The video directory is a symbolic link.')
+              if legacy:
+                  video_root.mkdir(exist_ok=True)
+                  for video_id in sorted(legacy):
+                      move_legacy_folder(video_id)
+              for video_id, assets in redirects.items():
+                  folder = video_root / video_id
+                  if folder.is_symlink():
+                      raise ValueError(f'The archive directory {folder} is a symbolic link.')
+                  for filename, (page, legacy_redirect) in assets.items():
+                      write_page(folder / (filename + '.html'), page, legacy_redirect)
+                      original = folder / filename
+                      if original.is_symlink():
+                          raise ValueError(f'The original path {original} is a symbolic link.')
+                      if not original.is_file():
+                          # GitHub Pages serves the index when a browser opens the filename URL.
+                          write_page(original / 'index.html', page, legacy_redirect)
+
+              if subprocess.run(('git', 'diff', '--cached', '--quiet')).returncode == 0:
+                  print('The archive download pages are up to date.')
+                  break
+              run('git', 'commit', '-m', 'Publish archive download pages')
+              if subprocess.run(('git', 'push', 'origin', f'HEAD:refs/heads/{branch}')).returncode == 0:
+                  break
+          else:
+              raise SystemExit('Could not push the archive download pages to the default branch.')
+          PY
