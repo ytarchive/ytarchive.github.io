@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>File unavailable</title>
+</head>
+<body>
+  <h1>File unavailable</h1>
+  <p>Check the download link and try again.</p>
+  <script>
+    if (/^\/video\/[A-Za-z0-9_-]{11}\/[^/]+$/.test(location.pathname)) {
+      const directory = location.pathname + "/";
+      fetch(directory, { method: "HEAD" }).then(response => {
+        if (response.ok && response.headers.get("content-type")?.startsWith("text/html")) {
+          location.replace(directory + location.search + location.hash);
+        }
+      }).catch(() => {});
+    }
+  </script>
+</body>
+</html>
